@@ -1,11 +1,14 @@
 """
 Comprehensive Integration Tests for MessMate:
+- PostgreSQL Schema Integrity (via ANSI information_schema)
 - Risk Score Engine
 - Response Cycles & Deadlines
 - Resolution Verification & Credits
 - Escalations & Food Safety Overrides
 - Gemini Integration & Fallback
 - Privacy & Role-Based Access Control
+- Transaction Atomicity & Rollback
+- Foreign Key Enforcement
 """
 
 import os
@@ -16,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from app import main as main_module
-from app.main import connect
+from app.db import connect, IntegrityError
 from app.risk_engine import (
     calculate_recurrence_points,
     calculate_delay_points,
@@ -45,7 +48,11 @@ def auth_headers(email):
 
 def test_database_schema_integrity():
     with connect() as c:
-        tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        # Standard PostgreSQL information_schema query
+        rows = c.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+        ).fetchall()
+        tables = [r["table_name"] for r in rows]
         assert "users" in tables
         assert "complaints" in tables
         assert "feedback" in tables
@@ -57,7 +64,10 @@ def test_database_schema_integrity():
         assert "risk_history" in tables
 
         # Verify columns on issue_groups
-        cols = [r[1] for r in c.execute("PRAGMA table_info(issue_groups)").fetchall()]
+        col_rows = c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='issue_groups'"
+        ).fetchall()
+        cols = [r["column_name"] for r in col_rows]
         for expected in ["risk_score", "risk_level", "recurrence_score", "delay_score", "resolution_credits", "is_food_safety_hazard", "distinct_weeks", "category"]:
             assert expected in cols, f"Missing column {expected} in issue_groups"
 
@@ -112,7 +122,6 @@ def test_risk_score_calculation_and_escalation_flow():
         c.execute("DELETE FROM issue_groups WHERE issue_key = 'test_curry_salt'")
         c.commit()
 
-    # Create an isolated issue group in SQLite
     now_iso = datetime.now(timezone.utc).isoformat()
     past_started = (datetime.now(timezone.utc) - timedelta(hours=50)).isoformat() # 50h ago -> 26h overdue -> 10 pts delay
     deadline_iso = (datetime.now(timezone.utc) - timedelta(hours=26)).isoformat()
@@ -120,19 +129,19 @@ def test_risk_score_calculation_and_escalation_flow():
     with connect() as c:
         cur = c.execute(
             """INSERT INTO issue_groups(meal_id, service_date, issue_key, category, title, summary, count, deadline, status, first_reported_at)
-               VALUES('lunch', '2026-10-01', 'test_curry_salt', 'Food taste', 'Salt Test Issue', 'Too much salt in curry', 5, ?, 'Open', ?)""",
+               VALUES('lunch', '2026-10-01', 'test_curry_salt', 'Food taste', 'Salt Test Issue', 'Too much salt in curry', 5, %s, 'Open', %s) RETURNING id""",
             (deadline_iso, past_started)
         )
-        group_id = cur.lastrowid
+        group_id = cur.fetchone()["id"]
         # Add 3 distinct weeks: Week 40, Week 41, Week 42 -> 3 distinct weeks -> W = 30
-        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?, '2026-W40', ?)", (group_id, past_started))
-        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?, '2026-W41', ?)", (group_id, past_started))
-        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?, '2026-W42', ?)", (group_id, past_started))
+        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(%s, '2026-W40', %s) ON CONFLICT (group_id, week_key) DO NOTHING", (group_id, past_started))
+        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(%s, '2026-W41', %s) ON CONFLICT (group_id, week_key) DO NOTHING", (group_id, past_started))
+        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(%s, '2026-W42', %s) ON CONFLICT (group_id, week_key) DO NOTHING", (group_id, past_started))
 
         # Add active response cycle
         c.execute(
             """INSERT INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
-               VALUES(?, 1, ?, ?, 'Overdue')""",
+               VALUES(%s, 1, %s, %s, 'Overdue') ON CONFLICT (group_id, cycle_number) DO NOTHING""",
             (group_id, past_started, deadline_iso)
         )
         c.commit()
@@ -141,7 +150,7 @@ def test_risk_score_calculation_and_escalation_flow():
         reconcile_issue_risk(c, group_id)
         c.commit()
 
-        row = c.execute("SELECT * FROM issue_groups WHERE id=?", (group_id,)).fetchone()
+        row = c.execute("SELECT * FROM issue_groups WHERE id=%s", (group_id,)).fetchone()
         # W = 30 (3 weeks), D = 15 (26h overdue = initial 10 + 5*(26//24) = 15), C = 0 -> R = 45 -> MEDIUM
         assert row["recurrence_score"] == 30
         assert row["delay_score"] == 15
@@ -150,20 +159,20 @@ def test_risk_score_calculation_and_escalation_flow():
 
         # Now add Week 43 and Week 44 -> 5 distinct weeks -> W capped at 45
         # Total raw score = 45 + 15 = 60 -> HIGH -> ESCALATION TRIGGERED!
-        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?, '2026-W43', ?)", (group_id, past_started))
-        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?, '2026-W44', ?)", (group_id, past_started))
+        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(%s, '2026-W43', %s) ON CONFLICT (group_id, week_key) DO NOTHING", (group_id, past_started))
+        c.execute("INSERT INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(%s, '2026-W44', %s) ON CONFLICT (group_id, week_key) DO NOTHING", (group_id, past_started))
         c.commit()
 
         reconcile_issue_risk(c, group_id)
         c.commit()
 
-        row_escalated = c.execute("SELECT * FROM issue_groups WHERE id=?", (group_id,)).fetchone()
+        row_escalated = c.execute("SELECT * FROM issue_groups WHERE id=%s", (group_id,)).fetchone()
         assert row_escalated["recurrence_score"] == 45
         assert row_escalated["risk_score"] == 60
         assert row_escalated["risk_level"] == "HIGH"
 
         # Verify active escalation record was created automatically
-        esc = c.execute("SELECT * FROM escalations WHERE group_id=? AND status='Active'", (group_id,)).fetchone()
+        esc = c.execute("SELECT * FROM escalations WHERE group_id=%s AND status='Active'", (group_id,)).fetchone()
         assert esc is not None
         assert esc["reason"] == "threshold_reached"
         assert esc["score_at_trigger"] == 60
@@ -172,7 +181,7 @@ def test_risk_score_calculation_and_escalation_flow():
         # Verify idempotence: reconciling again does NOT create duplicate active escalation
         reconcile_issue_risk(c, group_id)
         c.commit()
-        active_count = c.execute("SELECT COUNT(*) n FROM escalations WHERE group_id=? AND status='Active'", (group_id,)).fetchone()["n"]
+        active_count = c.execute("SELECT COUNT(*) n FROM escalations WHERE group_id=%s AND status='Active'", (group_id,)).fetchone()["n"]
         assert active_count == 1, "Escalation must be idempotent"
 
     # Manager responds -> stops delay penalty
@@ -184,7 +193,7 @@ def test_risk_score_calculation_and_escalation_flow():
     assert r_resp.status_code == 200
 
     with connect() as c:
-        row_after_resp = c.execute("SELECT * FROM issue_groups WHERE id=?", (group_id,)).fetchone()
+        row_after_resp = c.execute("SELECT * FROM issue_groups WHERE id=%s", (group_id,)).fetchone()
         assert row_after_resp["status"] == "Responded"
         # Delay is frozen, recurrence history is PRESERVED
         assert row_after_resp["recurrence_score"] == 45
@@ -217,7 +226,7 @@ def test_risk_score_calculation_and_escalation_flow():
     assert r_close.status_code == 200
 
     with connect() as c:
-        esc_closed = c.execute("SELECT * FROM escalations WHERE id=?", (esc_id,)).fetchone()
+        esc_closed = c.execute("SELECT * FROM escalations WHERE id=%s", (esc_id,)).fetchone()
         assert esc_closed["status"] == "Closed"
         assert esc_closed["closure_notes"] is not None
 
@@ -229,15 +238,14 @@ def test_urgent_food_safety_override():
 
     rev_headers = auth_headers("reviewer@test.invalid")
 
-    # Create a low-score issue (0 recurrence, 0 delay -> score 0)
     now_iso = datetime.now(timezone.utc).isoformat()
     with connect() as c:
         cur = c.execute(
             """INSERT INTO issue_groups(meal_id, service_date, issue_key, category, title, summary, count, deadline, status)
-               VALUES('dinner', '2026-10-24', 'safety_override_test', 'Hygiene and cleanliness', 'Safety Test', 'Insect reported', 1, ?, 'Open')""",
+               VALUES('dinner', '2026-10-24', 'safety_override_test', 'Hygiene and cleanliness', 'Safety Test', 'Insect reported', 1, %s, 'Open') RETURNING id""",
             (now_iso,)
         )
-        gid = cur.lastrowid
+        gid = cur.fetchone()["id"]
         c.commit()
 
     # Trigger urgent food safety override
@@ -249,27 +257,47 @@ def test_urgent_food_safety_override():
 
     # Even though numerical score is low, an urgent food safety escalation was created!
     with connect() as c:
-        esc = c.execute("SELECT * FROM escalations WHERE group_id=? AND status='Active'", (gid,)).fetchone()
+        esc = c.execute("SELECT * FROM escalations WHERE group_id=%s AND status='Active'", (gid,)).fetchone()
         assert esc is not None
         assert esc["reason"] == "urgent_food_safety"
 
 def test_gemini_fallback_and_validation():
-    # Rule based fallback normalization test
     slug, cat, title, summary, conf, is_haz = normalise_rule_based("Sambar was completely cold today")
     assert cat == "Food temperature"
     assert not is_haz
     assert conf >= 0.8
 
-    # Food safety hazard detection
     slug2, cat2, title2, summary2, conf2, is_haz2 = normalise_rule_based("Found a dead cockroach in the curry")
     assert is_haz2 is True
     assert cat2 == "Hygiene and cleanliness"
 
-if __name__ == "__main__":
-    test_database_schema_integrity()
-    test_role_enforcement_and_access_control()
-    test_student_privacy_guarantee()
-    test_risk_score_calculation_and_escalation_flow()
-    test_urgent_food_safety_override()
-    test_gemini_fallback_and_validation()
-    print("ALL API & SYSTEM INTEGRATION TESTS PASSED!")
+def test_foreign_key_enforcement():
+    """Verify that PostgreSQL foreign key constraints block invalid relational inserts."""
+    with connect() as c:
+        import pytest
+        with pytest.raises(Exception):
+            # Attempt to insert feedback referencing non-existent user_id 999999
+            c.execute(
+                """INSERT INTO feedback(user_id, meal_id, service_date, rating, items_json, comment, category, dietary, created_at)
+                   VALUES(999999, 'lunch', '2026-11-05', 5, '{}', 'test', 'General', 'veg', '2026-11-05T12:00:00')"""
+            )
+            c.commit()
+
+def test_transaction_rollback_on_failure():
+    """Verify that a transaction error rolls back changes atomically."""
+    test_identifier = "rollback_test_user@srm.edu"
+    try:
+        with connect() as c:
+            c.execute(
+                "INSERT INTO users(identifier, name, role, password_hash) VALUES(%s, 'Rollback Test', 'student', 'hash')",
+                (test_identifier,)
+            )
+            # Intentionally cause a syntax or constraint error in the same transaction
+            c.execute("INSERT INTO non_existent_table_for_rollback_test VALUES(1)")
+            c.commit()
+    except Exception:
+        pass
+
+    with connect() as c:
+        user = c.execute("SELECT id FROM users WHERE identifier=%s", (test_identifier,)).fetchone()
+        assert user is None, "Failed transaction must roll back uncommitted inserts"

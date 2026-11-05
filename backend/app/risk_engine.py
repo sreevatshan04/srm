@@ -162,7 +162,7 @@ def should_escalate(score: int, is_safety_hazard: bool = False) -> Tuple[bool, O
 def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Authoritative server-side risk recalculation for an issue group.
-    Updates SQLite state atomically:
+    Updates PostgreSQL state atomically:
       1. Counts distinct calendar weeks from issue_week_records
       2. Calculates recurrence points W
       3. Determines delay penalty D from active response cycle
@@ -174,7 +174,7 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
     now_dt = now_dt or datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
 
-    row = c.execute("SELECT * FROM issue_groups WHERE id=?", (group_id,)).fetchone()
+    row = c.execute("SELECT * FROM issue_groups WHERE id=%s", (group_id,)).fetchone()
     if not row:
         return {}
 
@@ -182,7 +182,7 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
     
     # 1. Distinct calendar weeks (W)
     week_count = c.execute(
-        "SELECT COUNT(DISTINCT week_key) as n FROM issue_week_records WHERE group_id=?",
+        "SELECT COUNT(DISTINCT week_key) as n FROM issue_week_records WHERE group_id=%s",
         (group_id,)
     ).fetchone()["n"]
     if week_count == 0:
@@ -191,7 +191,9 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
             s_dt = datetime.fromisoformat(issue["service_date"])
             w_key = get_calendar_week_key(s_dt)
             c.execute(
-                "INSERT OR IGNORE INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?,?,?)",
+                """INSERT INTO issue_week_records(group_id, week_key, first_seen_at)
+                   VALUES(%s,%s,%s)
+                   ON CONFLICT (group_id, week_key) DO NOTHING""",
                 (group_id, w_key, issue.get("first_reported_at") or now_iso)
             )
             week_count = 1
@@ -203,7 +205,7 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
     # 2. Response cycle delay (D)
     # Fetch active or latest cycle
     cycle_row = c.execute(
-        "SELECT * FROM response_cycles WHERE group_id=? ORDER BY cycle_number DESC LIMIT 1",
+        "SELECT * FROM response_cycles WHERE group_id=%s ORDER BY cycle_number DESC LIMIT 1",
         (group_id,)
     ).fetchone()
     
@@ -219,7 +221,7 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
         # Update cycle status if needed
         new_cycle_status = "Responded" if responded_at else ("Overdue" if is_overdue else "Open")
         if new_cycle_status != cycle["status"]:
-            c.execute("UPDATE response_cycles SET status=? WHERE id=?", (new_cycle_status, cycle["id"]))
+            c.execute("UPDATE response_cycles SET status=%s WHERE id=%s", (new_cycle_status, cycle["id"]))
     else:
         # Synthesize from issue_groups deadline / first_reported_at
         deadline_str = issue.get("deadline")
@@ -251,7 +253,7 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
 
     # 3. Verified Resolution Credits (C)
     credits_sum = c.execute(
-        "SELECT COALESCE(SUM(credit_applied), 0) as s FROM resolutions WHERE group_id=?",
+        "SELECT COALESCE(SUM(credit_applied), 0) as s FROM resolutions WHERE group_id=%s",
         (group_id,)
     ).fetchone()["s"]
 
@@ -270,9 +272,9 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
     # 5. Update issue_groups
     c.execute(
         """UPDATE issue_groups 
-           SET risk_score=?, risk_level=?, recurrence_score=?, delay_score=?, 
-               resolution_credits=?, distinct_weeks=?
-           WHERE id=?""",
+           SET risk_score=%s, risk_level=%s, recurrence_score=%s, delay_score=%s, 
+               resolution_credits=%s, distinct_weeks=%s
+           WHERE id=%s""",
         (final_score, risk_level, recurrence_pts, delay_pts, credits_sum, week_count, group_id)
     )
 
@@ -281,7 +283,7 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
         import json
         c.execute(
             """INSERT INTO risk_history(group_id, old_score, new_score, reason, breakdown_json, created_at)
-               VALUES(?,?,?,?,?,?)""",
+               VALUES(%s,%s,%s,%s,%s,%s)""",
             (group_id, old_score, final_score, "Score recalculated", json.dumps(risk_data["breakdown"]), now_iso)
         )
 
@@ -290,13 +292,13 @@ def reconcile_issue_risk(c, group_id: int, now_dt: Optional[datetime] = None) ->
     if esc_needed:
         # Ensure idempotent: only insert if no ACTIVE escalation exists
         active_esc = c.execute(
-            "SELECT id FROM escalations WHERE group_id=? AND status='Active'",
+            "SELECT id FROM escalations WHERE group_id=%s AND status='Active'",
             (group_id,)
         ).fetchone()
         if not active_esc:
             c.execute(
                 """INSERT INTO escalations(group_id, reason, score_at_trigger, triggered_at, status)
-                   VALUES(?,?,?,?, 'Active')""",
+                   VALUES(%s,%s,%s,%s, 'Active')""",
                 (group_id, esc_reason, final_score, now_iso)
             )
 
@@ -310,13 +312,13 @@ def evaluate_positive_feedback_trigger_b(c, group_id: int, now_dt: Optional[date
     Grants 15 points credit once per qualifying cycle.
     """
     now_dt = now_dt or datetime.now(timezone.utc)
-    issue = c.execute("SELECT * FROM issue_groups WHERE id=?", (group_id,)).fetchone()
+    issue = c.execute("SELECT * FROM issue_groups WHERE id=%s", (group_id,)).fetchone()
     if not issue:
         return False
         
     # Check if already received a Trigger B credit
     existing_b = c.execute(
-        "SELECT id FROM resolutions WHERE group_id=? AND trigger_type='positive_feedback'",
+        "SELECT id FROM resolutions WHERE group_id=%s AND trigger_type='positive_feedback'",
         (group_id,)
     ).fetchone()
     if existing_b:
@@ -331,7 +333,7 @@ def evaluate_positive_feedback_trigger_b(c, group_id: int, now_dt: Optional[date
 
     # Check feedback ratings submitted in subsequent weeks
     ratings_by_week = c.execute(
-        "SELECT service_date, rating FROM feedback WHERE meal_id=?",
+        "SELECT service_date, rating FROM feedback WHERE meal_id=%s",
         (meal_id,)
     ).fetchall()
 
@@ -350,7 +352,7 @@ def evaluate_positive_feedback_trigger_b(c, group_id: int, now_dt: Optional[date
             # Condition met! Apply Trigger B resolution credit
             c.execute(
                 """INSERT INTO resolutions(group_id, trigger_type, verified_by, credit_applied, notes, verified_at)
-                   VALUES(?, 'positive_feedback', 'Automated Feedback Monitor', ?, ?, ?)""",
+                   VALUES(%s, 'positive_feedback', 'Automated Feedback Monitor', %s, %s, %s)""",
                 (group_id, RESOLUTION_REDUCTION_POINTS, f"Subsequent week {w} average rating exceeded 4.0 ({len(r_list)} reviews)", now_dt.isoformat())
             )
             reconcile_issue_risk(c, group_id, now_dt=now_dt)
@@ -368,4 +370,3 @@ def reconcile_all_issues(connect_fn, now_dt: Optional[datetime] = None):
             evaluate_positive_feedback_trigger_b(c, gid, now_dt=now_dt)
             reconcile_issue_risk(c, gid, now_dt=now_dt)
         c.commit()
-
