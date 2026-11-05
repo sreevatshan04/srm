@@ -3,3 +3,4 @@ pydantic>=2.0
 tzdata>=2024.1
 google-genai>=2.0.0
 python-dotenv>=1.0.0
+firebase-admin>=6.5,<8.0
