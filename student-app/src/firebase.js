@@ -5,13 +5,13 @@ import { getAuth } from 'firebase/auth';
 // Firebase web configuration is public client configuration. Security is enforced
 // by Firebase Authentication and backend-verified ID tokens, not by hiding this key.
 const firebaseConfig = {
-  apiKey: 'AIzaSyA3Hrh5M0eLHqIuwt7OGRhzPmQDLCntx-0',
-  authDomain: 'mess-mate-418df.firebaseapp.com',
-  projectId: 'mess-mate-418df',
-  storageBucket: 'mess-mate-418df.firebasestorage.app',
-  messagingSenderId: '277586371439',
-  appId: '1:277586371439:web:f80278d23f4282a2b1be9a',
-  measurementId: 'G-KTBF1Y1038',
+  apiKey: "AIzaSyCg7QQmcbCt8X9Wy_fOh05bAPQnLh_UKow",
+  authDomain: "messmate-production.firebaseapp.com",
+  projectId: "messmate-production",
+  storageBucket: "messmate-production.firebasestorage.app",
+  messagingSenderId: "279941774828",
+  appId: "1:279941774828:web:a6a43b68f44a35668194c9",
+  measurementId: "G-V4B9P30LH0"
 };
 
 export const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
