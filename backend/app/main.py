@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-import sqlite3, os, secrets, hashlib, hmac, json, re
+import os, secrets, hashlib, hmac, json, re
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials
 
@@ -13,6 +13,7 @@ from firebase_admin import auth as firebase_auth, credentials
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+from app.db import connect, init_db, IntegrityError
 from app.menus import OFFICIAL_MENUS, get_official_menu, WEEKDAYS
 from app.risk_engine import (
     calculate_recurrence_points,
@@ -34,9 +35,6 @@ from app.gemini_service import (
     generate_meal_summary
 )
 
-# Vercel's writable filesystem is ephemeral; start a fresh schema in /tmp rather
-# than copying the former demo-seeded database into deployments.
-DB_PATH = "/tmp/messmate.db" if os.environ.get("VERCEL") else os.path.join(BASE_DIR, "messmate.db")
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Kolkata"))
 ALLOW_FEEDBACK_OUTSIDE_WINDOW = os.getenv(
     "ALLOW_FEEDBACK_OUTSIDE_WINDOW",
@@ -66,62 +64,6 @@ MEALS = [
 def menu_for_date(day, dietary="non_veg"):
     day_name = day.strftime("%A").lower()
     return {m: get_official_menu(day_name, m, dietary) for m in ["breakfast", "lunch", "snacks", "dinner"]}
-
-def connect():
-    c = sqlite3.connect(DB_PATH, timeout=10)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
-
-def migrate_user_role_constraint():
-    """Allow reviewer accounts in databases created before reviewer support."""
-    if not os.path.exists(DB_PATH):
-        return
-
-    c = sqlite3.connect(DB_PATH, timeout=10)
-    try:
-        c.execute("PRAGMA foreign_keys=OFF")
-        table = c.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
-        ).fetchone()
-        if not table or "reviewer" in (table[0] or "").lower():
-            return
-
-        existing = {row[1] for row in c.execute("PRAGMA table_info(users)")}
-        columns = [
-            "id", "identifier", "name", "role", "password_hash", "register_no",
-            "department", "semester", "theme", "dietary_preference",
-        ]
-        select_values = {
-            "id": "id", "identifier": "identifier", "name": "name", "role": "role",
-            "password_hash": "password_hash", "register_no": "register_no",
-            "department": "department", "semester": "semester", "theme": "theme",
-            "dietary_preference": "dietary_preference",
-        }
-        copied = [name for name in columns if name in existing]
-        c.execute("""
-            CREATE TABLE users_new(
-                id INTEGER PRIMARY KEY,
-                identifier TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('student','manager','reviewer')),
-                password_hash TEXT NOT NULL,
-                register_no TEXT,
-                department TEXT,
-                semester TEXT,
-                theme TEXT DEFAULT 'light',
-                dietary_preference TEXT DEFAULT 'non_veg'
-            )
-        """)
-        c.execute(
-            f"INSERT INTO users_new ({','.join(copied)}) "
-            f"SELECT {','.join(select_values[name] for name in copied)} FROM users"
-        )
-        c.execute("DROP TABLE users")
-        c.execute("ALTER TABLE users_new RENAME TO users")
-        c.commit()
-    finally:
-        c.close()
 
 def hash_password(password, salt=None):
     salt = salt or secrets.token_hex(16)
@@ -164,24 +106,24 @@ def firebase_profile(claims: dict) -> dict:
     name = str(claims.get("name") or email.split("@", 1)[0])[:120]
 
     with connect() as connection:
-        user = connection.execute("SELECT * FROM users WHERE firebase_uid=? OR LOWER(identifier)=?", (uid, email)).fetchone()
+        user = connection.execute("SELECT * FROM users WHERE firebase_uid=%s OR LOWER(identifier)=%s", (uid, email)).fetchone()
         if user:
             if user["firebase_uid"] and user["firebase_uid"] != uid:
                 raise HTTPException(409, "This email is already linked to another Firebase account.")
             connection.execute(
-                "UPDATE users SET firebase_uid=?, identifier=?, name=?, role=? WHERE id=?",
+                "UPDATE users SET firebase_uid=%s, identifier=%s, name=%s, role=%s WHERE id=%s",
                 (uid, email, name, role, user["id"]),
             )
             user_id = user["id"]
         else:
             cursor = connection.execute(
                 """INSERT INTO users(firebase_uid,identifier,name,role,password_hash)
-                   VALUES(?,?,?,?,?)""",
+                   VALUES(%s,%s,%s,%s,%s) RETURNING id""",
                 (uid, email, name, role, hash_password(secrets.token_urlsafe(64))),
             )
-            user_id = cursor.lastrowid
+            user_id = cursor.fetchone()["id"]
         connection.commit()
-        user = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        user = connection.execute("SELECT * FROM users WHERE id=%s", (user_id,)).fetchone()
     return {
         "id": user["id"], "name": user["name"], "role": user["role"],
         "identifier": user["identifier"], "register_no": user["register_no"],
@@ -189,265 +131,23 @@ def firebase_profile(claims: dict) -> dict:
         "theme": user["theme"], "dietary_preference": user["dietary_preference"],
     }
 
-def init_db():
-    with connect() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY,
-            firebase_uid TEXT UNIQUE,
-            identifier TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('student','manager','reviewer')),
-            password_hash TEXT NOT NULL,
-            register_no TEXT,
-            department TEXT,
-            semester TEXT,
-            theme TEXT DEFAULT 'light',
-            dietary_preference TEXT DEFAULT 'non_veg'
-        );
-        CREATE TABLE IF NOT EXISTS feedback(
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            meal_id TEXT NOT NULL,
-            service_date TEXT NOT NULL,
-            rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
-            items_json TEXT NOT NULL DEFAULT '{}',
-            comment TEXT DEFAULT '',
-            category TEXT DEFAULT '',
-            dietary TEXT DEFAULT 'non_veg',
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS complaints(
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            meal_id TEXT NOT NULL,
-            service_date TEXT NOT NULL,
-            category TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Submitted',
-            processed_for_ai INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS issue_groups(
-            id INTEGER PRIMARY KEY,
-            meal_id TEXT NOT NULL,
-            service_date TEXT NOT NULL,
-            issue_key TEXT NOT NULL,
-            title TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Open',
-            response TEXT DEFAULT '',
-            responded_at TEXT,
-            deadline TEXT NOT NULL,
-            UNIQUE(meal_id, service_date, issue_key)
-        );
-        CREATE TABLE IF NOT EXISTS complaint_group_links(
-            complaint_id INTEGER PRIMARY KEY REFERENCES complaints(id) ON DELETE CASCADE,
-            group_id INTEGER NOT NULL REFERENCES issue_groups(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS menu_items(
-            id INTEGER PRIMARY KEY,
-            menu_date TEXT NOT NULL,
-            meal_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            dietary_type TEXT NOT NULL DEFAULT 'Veg'
-        );
-        CREATE TABLE IF NOT EXISTS issue_week_records(
-            id INTEGER PRIMARY KEY,
-            group_id INTEGER NOT NULL REFERENCES issue_groups(id) ON DELETE CASCADE,
-            week_key TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL,
-            UNIQUE(group_id, week_key)
-        );
-        CREATE TABLE IF NOT EXISTS response_cycles(
-            id INTEGER PRIMARY KEY,
-            group_id INTEGER NOT NULL REFERENCES issue_groups(id) ON DELETE CASCADE,
-            cycle_number INTEGER NOT NULL DEFAULT 1,
-            started_at TEXT NOT NULL,
-            deadline TEXT NOT NULL,
-            responded_at TEXT,
-            response_text TEXT,
-            status TEXT NOT NULL DEFAULT 'Open',
-            UNIQUE(group_id, cycle_number)
-        );
-        CREATE TABLE IF NOT EXISTS resolutions(
-            id INTEGER PRIMARY KEY,
-            group_id INTEGER NOT NULL REFERENCES issue_groups(id) ON DELETE CASCADE,
-            trigger_type TEXT NOT NULL,
-            verified_by TEXT NOT NULL,
-            credit_applied INTEGER NOT NULL DEFAULT 15,
-            notes TEXT DEFAULT '',
-            verified_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS escalations(
-            id INTEGER PRIMARY KEY,
-            group_id INTEGER NOT NULL REFERENCES issue_groups(id) ON DELETE CASCADE,
-            reason TEXT NOT NULL,
-            score_at_trigger INTEGER NOT NULL,
-            triggered_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Active',
-            closed_at TEXT,
-            closed_by TEXT,
-            closure_notes TEXT
-        );
-        CREATE TABLE IF NOT EXISTS risk_history(
-            id INTEGER PRIMARY KEY,
-            group_id INTEGER NOT NULL REFERENCES issue_groups(id) ON DELETE CASCADE,
-            old_score INTEGER NOT NULL,
-            new_score INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            breakdown_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS ai_processing_jobs(
-            id INTEGER PRIMARY KEY,
-            batch_size INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'completed',
-            model TEXT,
-            provider TEXT,
-            error_message TEXT,
-            created_at TEXT NOT NULL
-        );
-        ''')
-
-        # Check for column migrations if database already existed
-        comp_cols = [r["name"] for r in c.execute("PRAGMA table_info(complaints)").fetchall()]
-        if "processed_for_ai" not in comp_cols:
-            c.execute("ALTER TABLE complaints ADD COLUMN processed_for_ai INTEGER DEFAULT 0")
-
-        feed_cols = [r["name"] for r in c.execute("PRAGMA table_info(feedback)").fetchall()]
-        if "dietary" not in feed_cols:
-            c.execute("ALTER TABLE feedback ADD COLUMN dietary TEXT DEFAULT 'non_veg'")
-
-        # Remove the legacy one-rating-per-user/meal/day constraint for testing.
-        feedback_sql = c.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='feedback'"
-        ).fetchone()["sql"] or ""
-        if "UNIQUE(user_id, meal_id, service_date)" in feedback_sql.replace("\n", " "):
-            c.execute("PRAGMA foreign_keys=OFF")
-            c.execute("ALTER TABLE feedback RENAME TO feedback_legacy")
-            c.execute("""
-                CREATE TABLE feedback(
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    meal_id TEXT NOT NULL,
-                    service_date TEXT NOT NULL,
-                    rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
-                    items_json TEXT NOT NULL DEFAULT '{}',
-                    comment TEXT DEFAULT '',
-                    category TEXT DEFAULT '',
-                    dietary TEXT DEFAULT 'non_veg',
-                    created_at TEXT NOT NULL
-                )
-            """)
-            c.execute("""
-                INSERT INTO feedback(id,user_id,meal_id,service_date,rating,items_json,comment,category,dietary,created_at)
-                SELECT id,user_id,meal_id,service_date,rating,items_json,comment,category,dietary,created_at
-                FROM feedback_legacy
-            """)
-            c.execute("DROP TABLE feedback_legacy")
-            c.execute("PRAGMA foreign_keys=ON")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_period ON feedback(meal_id, service_date)")
-
-        user_cols = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
-        if "dietary_preference" not in user_cols:
-            c.execute("ALTER TABLE users ADD COLUMN dietary_preference TEXT DEFAULT 'non_veg'")
-        if "firebase_uid" not in user_cols:
-            c.execute("ALTER TABLE users ADD COLUMN firebase_uid TEXT")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid) WHERE firebase_uid IS NOT NULL")
-
-        # Migrate issue_groups columns for Risk Engine
-        ig_cols = [r["name"] for r in c.execute("PRAGMA table_info(issue_groups)").fetchall()]
-        new_ig_cols = [
-            ("risk_score", "INTEGER DEFAULT 0"),
-            ("risk_level", "TEXT DEFAULT 'LOW'"),
-            ("recurrence_score", "INTEGER DEFAULT 0"),
-            ("delay_score", "INTEGER DEFAULT 0"),
-            ("resolution_credits", "INTEGER DEFAULT 0"),
-            ("distinct_weeks", "INTEGER DEFAULT 1"),
-            ("is_food_safety_hazard", "INTEGER DEFAULT 0"),
-            ("category", "TEXT DEFAULT 'Food quality'"),
-            ("first_reported_at", "TEXT"),
-            ("last_reported_at", "TEXT"),
-            ("confidence", "REAL DEFAULT 0.9")
-        ]
-        for col_name, col_def in new_ig_cols:
-            if col_name not in ig_cols:
-                c.execute(f"ALTER TABLE issue_groups ADD COLUMN {col_name} {col_def}")
-
-        # Create performance indexes
-        c.executescript('''
-        CREATE INDEX IF NOT EXISTS idx_complaints_ai ON complaints(processed_for_ai);
-        CREATE INDEX IF NOT EXISTS idx_complaints_period ON complaints(meal_id, service_date);
-        CREATE INDEX IF NOT EXISTS idx_feedback_period ON feedback(meal_id, service_date);
-        CREATE INDEX IF NOT EXISTS idx_issue_groups_period ON issue_groups(meal_id, service_date);
-        CREATE INDEX IF NOT EXISTS idx_issue_groups_risk ON issue_groups(risk_score, risk_level);
-        CREATE INDEX IF NOT EXISTS idx_menu_items_date ON menu_items(menu_date, meal_id);
-        CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status, group_id);
-        CREATE INDEX IF NOT EXISTS idx_week_records_group ON issue_week_records(group_id, week_key);
-        ''')
-
-        # Purge records created by the former demo-seeding routine. This also
-        # cleans existing local databases during the Firebase auth migration.
-        legacy_session_table = c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
-        ).fetchone()
-        seeded_users = [row["id"] for row in c.execute(
-            """SELECT id FROM users WHERE identifier IN (
-                   'student@srm.edu','manager@srm.edu','reviewer@srm.edu'
-               ) OR identifier LIKE 'demo.student%@srm.edu'"""
-        ).fetchall()]
-        seeded_user_ids = [row["id"] for row in c.execute(
-            "SELECT id FROM users WHERE register_no='RA2311003010001' OR name LIKE 'Demo Student %'"
-        ).fetchall()]
-        seeded_user_ids = list(set(seeded_user_ids + seeded_users))
-        if seeded_user_ids:
-            placeholders = ",".join("?" for _ in seeded_user_ids)
-            if legacy_session_table:
-                c.execute(f"DELETE FROM sessions WHERE user_id IN ({placeholders})", seeded_user_ids)
-            c.execute(f"DELETE FROM feedback WHERE user_id IN ({placeholders})", seeded_user_ids)
-            c.execute(f"DELETE FROM complaints WHERE user_id IN ({placeholders})", seeded_user_ids)
-            c.execute(f"DELETE FROM users WHERE id IN ({placeholders})", seeded_user_ids)
-        if legacy_session_table:
-            c.execute("DROP TABLE sessions")
-        c.execute("DELETE FROM issue_groups WHERE issue_key LIKE 'demo_seed_%' OR title LIKE 'Demo feedback:%'")
-        c.execute("DELETE FROM complaints WHERE title LIKE 'Demo feedback:%'")
-        c.execute("DELETE FROM menu_items WHERE description='Official CEG Hostel Menu'")
-
-        # Seed initial week records and response cycles for existing issue groups if missing
-        groups = c.execute("SELECT id, meal_id, service_date, deadline, response, responded_at, status FROM issue_groups").fetchall()
-        for g in groups:
-            s_date = g["service_date"]
-            try:
-                s_dt = datetime.fromisoformat(s_date)
-                w_key = get_calendar_week_key(s_dt)
-            except Exception:
-                w_key = get_calendar_week_key(datetime.now(TZ))
-            c.execute(
-                "INSERT OR IGNORE INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?,?,?)",
-                (g["id"], w_key, datetime.now(TZ).isoformat())
-            )
-            c.execute(
-                "INSERT OR IGNORE INTO response_cycles(group_id, cycle_number, started_at, deadline, responded_at, response_text, status) VALUES(?,?,?,?,?,?,?)",
-                (g["id"], 1, datetime.now(TZ).isoformat(), g["deadline"], g["responded_at"], g["response"], "Responded" if g["responded_at"] else "Open")
-            )
-        c.commit()
-
-migrate_user_role_constraint()
-init_db()
-
-# Synchronously seed baseline issue groups from complaints on startup without blocking
+# Startup database initialization and seeding
 def _seed_initial_groups():
-    with connect() as c:
-        unprocessed = c.execute("SELECT COUNT(*) n FROM complaints WHERE processed_for_ai=0").fetchone()["n"]
-    if unprocessed > 0:
-        process_pending_complaints_job(connect, {m["id"]: m for m in MEALS}, TZ)
-    reconcile_all_issues(connect)
+    try:
+        with connect() as c:
+            unprocessed = c.execute("SELECT COUNT(*) n FROM complaints WHERE processed_for_ai=0").fetchone()["n"]
+        if unprocessed > 0:
+            process_pending_complaints_job(connect, {m["id"]: m for m in MEALS}, TZ)
+        reconcile_all_issues(connect)
+    except Exception as e:
+        # Non-fatal during static builds, offline tooling, or unconfigured testing
+        print(f"[MessMate] Database seeding deferred: {e}")
 
-_seed_initial_groups()
+try:
+    init_db()
+    _seed_initial_groups()
+except Exception as e:
+    print(f"[MessMate] Database initialization deferred: {e}")
 
 @app.post("/api/auth/firebase")
 def login_with_firebase(authorization: Optional[str] = Header(default=None)):
@@ -539,9 +239,9 @@ def resolve_menu_items(target_date: date, meal_id: str, dietary: str = "non_veg"
     with connect() as c:
         dtype_filter = "Veg" if dietary == "veg" else None
         if dtype_filter:
-            rows = c.execute("SELECT name FROM menu_items WHERE menu_date=? AND meal_id=? AND dietary_type='Veg' ORDER BY id", (d_str, meal_id)).fetchall()
+            rows = c.execute("SELECT name FROM menu_items WHERE menu_date=%s AND meal_id=%s AND dietary_type='Veg' ORDER BY id", (d_str, meal_id)).fetchall()
         else:
-            rows = c.execute("SELECT name FROM menu_items WHERE menu_date=? AND meal_id=? ORDER BY id", (d_str, meal_id)).fetchall()
+            rows = c.execute("SELECT name FROM menu_items WHERE menu_date=%s AND meal_id=%s ORDER BY id", (d_str, meal_id)).fetchall()
         if rows:
             return [r["name"] for r in rows]
     
@@ -573,7 +273,7 @@ def set_theme(body: ThemeBody, user=Depends(current_user)):
     if body.theme not in ("light", "dark"):
         raise HTTPException(400, "Theme must be light or dark")
     with connect() as c:
-        c.execute("UPDATE users SET theme=? WHERE id=?", (body.theme, user["id"]))
+        c.execute("UPDATE users SET theme=%s WHERE id=%s", (body.theme, user["id"]))
         c.commit()
     return {"theme": body.theme}
 
@@ -636,7 +336,7 @@ def complete_menu(dietary: str = Query(default="non_veg"), user=Depends(current_
 def my_feedback(user=Depends(require_role("student"))):
     with connect() as c:
         ratings = [dict(r) for r in c.execute(
-            "SELECT id,meal_id,service_date,rating,comment,category,created_at FROM feedback WHERE user_id=? ORDER BY created_at DESC",
+            "SELECT id,meal_id,service_date,rating,comment,category,created_at FROM feedback WHERE user_id=%s ORDER BY created_at DESC",
             (user["id"],)
         ).fetchall()]
 
@@ -646,7 +346,7 @@ def my_feedback(user=Depends(require_role("student"))):
                FROM complaints c
                LEFT JOIN complaint_group_links l ON l.complaint_id=c.id
                LEFT JOIN issue_groups g ON g.id=l.group_id
-               WHERE c.user_id=? ORDER BY c.created_at DESC""",
+               WHERE c.user_id=%s ORDER BY c.created_at DESC""",
             (user["id"],)
         ).fetchall()]
 
@@ -666,7 +366,7 @@ def student_feedback_responses(user=Depends(require_role("student"))):
         ).fetchall()
 
     ratings_by_meal = {
-        row["meal_id"]: {"average": round(row["average"], 1), "count": row["count"]}
+        row["meal_id"]: {"average": round(float(row["average"]), 1) if row["average"] is not None else None, "count": row["count"]}
         for row in rating_rows
     }
     issues_by_meal = {meal["id"]: [] for meal in MEALS}
@@ -711,7 +411,7 @@ def submit_feedback(body: FeedbackBody, user=Depends(require_role("student"))):
     with connect() as c:
         if not ALLOW_MULTIPLE_FEEDBACK:
             existing = c.execute(
-                "SELECT 1 FROM feedback WHERE user_id=? AND meal_id=? AND service_date=? LIMIT 1",
+                "SELECT 1 FROM feedback WHERE user_id=%s AND meal_id=%s AND service_date=%s LIMIT 1",
                 (user["id"], body.meal_id, service_date),
             ).fetchone()
             if existing:
@@ -719,11 +419,11 @@ def submit_feedback(body: FeedbackBody, user=Depends(require_role("student"))):
         try:
             c.execute(
                 """INSERT INTO feedback(user_id,meal_id,service_date,rating,items_json,comment,category,dietary,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (user["id"], body.meal_id, service_date, body.rating, json.dumps(body.items or {}), body.comment.strip()[:1000], body.category.strip()[:60], body.dietary, now_iso)
             )
             c.commit()
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             raise HTTPException(400, "Feedback could not be saved. Check your rating and try again.")
 
     return {"ok": True, "message": "Thanks! Your feedback has been submitted."}
@@ -749,11 +449,11 @@ def submit_complaint(body: ComplaintBody, background_tasks: BackgroundTasks, use
     with connect() as c:
         cur = c.execute(
             """INSERT INTO complaints(user_id,meal_id,service_date,category,title,description,status,processed_for_ai,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (user["id"], body.meal_id, service_date, body.category.strip()[:60], title[:120], desc[:2000], "Submitted", 0, now_iso)
         )
         c.commit()
-        comp_id = cur.lastrowid
+        comp_id = cur.fetchone()["id"]
 
     # Queue Gemini AI processing in the background - zero wait for the student
     background_tasks.add_task(process_pending_complaints_job, connect, {m["id"]: m for m in MEALS}, TZ)
@@ -770,11 +470,11 @@ def manager_overview(user=Depends(require_roles("manager", "reviewer"))):
     today = datetime.now(TZ).date().isoformat()
     with connect() as c:
         ratings = c.execute(
-            "SELECT meal_id, AVG(rating) avg, COUNT(*) count FROM feedback WHERE service_date=? GROUP BY meal_id",
+            "SELECT meal_id, AVG(rating) avg, COUNT(*) count FROM feedback WHERE service_date=%s GROUP BY meal_id",
             (today,)
         ).fetchall()
-        total_complaints = c.execute("SELECT COUNT(*) n FROM complaints WHERE service_date=?", (today,)).fetchone()["n"]
-        rating_total = c.execute("SELECT COUNT(*) n FROM feedback WHERE service_date=?", (today,)).fetchone()["n"]
+        total_complaints = c.execute("SELECT COUNT(*) n FROM complaints WHERE service_date=%s", (today,)).fetchone()["n"]
+        rating_total = c.execute("SELECT COUNT(*) n FROM feedback WHERE service_date=%s", (today,)).fetchone()["n"]
         pending_ai = c.execute("SELECT COUNT(*) n FROM complaints WHERE processed_for_ai=0").fetchone()["n"]
         
         # Risk score summaries
@@ -792,7 +492,7 @@ def manager_overview(user=Depends(require_roles("manager", "reviewer"))):
             "SELECT * FROM issue_groups ORDER BY risk_score DESC, CASE status WHEN 'Open' THEN 0 ELSE 1 END, count DESC LIMIT 100"
         ).fetchall()
 
-    meal_ratings = {r["meal_id"]: {"average": round(r["avg"], 1), "count": r["count"]} for r in ratings}
+    meal_ratings = {r["meal_id"]: {"average": round(float(r["avg"]), 1) if r["avg"] is not None else 0.0, "count": r["count"]} for r in ratings}
     
     out = []
     now_dt = datetime.now(TZ)
@@ -839,13 +539,13 @@ def get_manager_issues(
         query = "SELECT * FROM issue_groups WHERE 1=1"
         params = []
         if meal_id and meal_id != "all":
-            query += " AND meal_id=?"
+            query += " AND meal_id=%s"
             params.append(meal_id)
         if risk_level and risk_level != "all":
-            query += " AND risk_level=?"
+            query += " AND risk_level=%s"
             params.append(risk_level.upper())
         if status and status != "all":
-            query += " AND status=?"
+            query += " AND status=%s"
             params.append(status)
         query += " ORDER BY risk_score DESC, count DESC"
         rows = c.execute(query, params).fetchall()
@@ -854,9 +554,9 @@ def get_manager_issues(
         now_dt = datetime.now(TZ)
         for r in rows:
             d = dict(r)
-            esc = c.execute("SELECT * FROM escalations WHERE group_id=? AND status='Active' LIMIT 1", (d["id"],)).fetchone()
+            esc = c.execute("SELECT * FROM escalations WHERE group_id=%s AND status='Active' LIMIT 1", (d["id"],)).fetchone()
             d["escalation"] = dict(esc) if esc else None
-            cycle = c.execute("SELECT * FROM response_cycles WHERE group_id=? ORDER BY cycle_number DESC LIMIT 1", (d["id"],)).fetchone()
+            cycle = c.execute("SELECT * FROM response_cycles WHERE group_id=%s ORDER BY cycle_number DESC LIMIT 1", (d["id"],)).fetchone()
             d["cycle"] = dict(cycle) if cycle else None
             d["overdue"] = d["status"] not in ("Responded", "Resolved") and now_dt > datetime.fromisoformat(d["deadline"])
             d["score_breakdown"] = {
@@ -873,14 +573,14 @@ def get_manager_issues(
 @app.get("/api/manager/issues/{issue_id}")
 def get_manager_issue_details(issue_id: int, user=Depends(require_roles("manager", "reviewer"))):
     with connect() as c:
-        row = c.execute("SELECT * FROM issue_groups WHERE id=?", (issue_id,)).fetchone()
+        row = c.execute("SELECT * FROM issue_groups WHERE id=%s", (issue_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Issue not found")
         issue = dict(row)
-        cycles = [dict(r) for r in c.execute("SELECT * FROM response_cycles WHERE group_id=? ORDER BY cycle_number ASC", (issue_id,)).fetchall()]
-        resolutions = [dict(r) for r in c.execute("SELECT * FROM resolutions WHERE group_id=? ORDER BY id DESC", (issue_id,)).fetchall()]
-        escalations = [dict(r) for r in c.execute("SELECT * FROM escalations WHERE group_id=? ORDER BY id DESC", (issue_id,)).fetchall()]
-        history = [dict(r) for r in c.execute("SELECT * FROM risk_history WHERE group_id=? ORDER BY id DESC", (issue_id,)).fetchall()]
+        cycles = [dict(r) for r in c.execute("SELECT * FROM response_cycles WHERE group_id=%s ORDER BY cycle_number ASC", (issue_id,)).fetchall()]
+        resolutions = [dict(r) for r in c.execute("SELECT * FROM resolutions WHERE group_id=%s ORDER BY id DESC", (issue_id,)).fetchall()]
+        escalations = [dict(r) for r in c.execute("SELECT * FROM escalations WHERE group_id=%s ORDER BY id DESC", (issue_id,)).fetchall()]
+        history = [dict(r) for r in c.execute("SELECT * FROM risk_history WHERE group_id=%s ORDER BY id DESC", (issue_id,)).fetchall()]
         # Privacy-guaranteed complaints (strictly NO user_id, student name, email, or reg_no)
         complaints = [
             {
@@ -897,7 +597,7 @@ def get_manager_issue_details(issue_id: int, user=Depends(require_roles("manager
                 """SELECT c.id, c.meal_id, c.service_date, c.category, c.title, c.description, c.status, c.created_at
                    FROM complaints c 
                    JOIN complaint_group_links l ON l.complaint_id=c.id 
-                   WHERE l.group_id=?""",
+                   WHERE l.group_id=%s""",
                 (issue_id,)
             ).fetchall()
         ]
@@ -921,22 +621,22 @@ def respond_issue(issue_id: int, body: ResponseBody, user=Depends(require_roles(
         raise HTTPException(422, "Please enter a valid response.")
     now = datetime.now(TZ).isoformat()
     with connect() as c:
-        row = c.execute("SELECT id, deadline FROM issue_groups WHERE id=?", (issue_id,)).fetchone()
+        row = c.execute("SELECT id, deadline FROM issue_groups WHERE id=%s", (issue_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Issue not found")
         # Freeze response delay for active cycle
         c.execute(
             """UPDATE response_cycles 
-               SET responded_at=?, response_text=?, status='Responded'
-               WHERE group_id=? AND status IN ('Open', 'Overdue')""",
+               SET responded_at=%s, response_text=%s, status='Responded'
+               WHERE group_id=%s AND status IN ('Open', 'Overdue')""",
             (now, response[:1500], issue_id)
         )
         c.execute(
-            "UPDATE issue_groups SET response=?, responded_at=?, status='Responded' WHERE id=?",
+            "UPDATE issue_groups SET response=%s, responded_at=%s, status='Responded' WHERE id=%s",
             (response[:1500], now, issue_id)
         )
         c.execute(
-            "UPDATE complaints SET status='Responded' WHERE id IN (SELECT complaint_id FROM complaint_group_links WHERE group_id=?)",
+            "UPDATE complaints SET status='Responded' WHERE id IN (SELECT complaint_id FROM complaint_group_links WHERE group_id=%s)",
             (issue_id,)
         )
         # Recalculate score immediately
@@ -954,13 +654,13 @@ def verify_resolution(issue_id: int, body: ResolutionBody, user=Depends(require_
     credit = body.credit_amount if (body.credit_amount is not None and body.credit_amount > 0) else RESOLUTION_REDUCTION_POINTS
     now = datetime.now(TZ).isoformat()
     with connect() as c:
-        issue = c.execute("SELECT * FROM issue_groups WHERE id=?", (issue_id,)).fetchone()
+        issue = c.execute("SELECT * FROM issue_groups WHERE id=%s", (issue_id,)).fetchone()
         if not issue:
             raise HTTPException(404, "Issue not found")
         
         # Check if already verified in this cycle
         existing = c.execute(
-            "SELECT id FROM resolutions WHERE group_id=? AND trigger_type=?",
+            "SELECT id FROM resolutions WHERE group_id=%s AND trigger_type=%s",
             (issue_id, body.trigger_type)
         ).fetchone()
         if existing and issue["status"] == "Resolved":
@@ -968,20 +668,20 @@ def verify_resolution(issue_id: int, body: ResolutionBody, user=Depends(require_
 
         c.execute(
             """INSERT INTO resolutions(group_id, trigger_type, verified_by, credit_applied, notes, verified_at)
-               VALUES(?,?,?,?,?,?)""",
+               VALUES(%s,%s,%s,%s,%s,%s)""",
             (issue_id, body.trigger_type, user.get("name") or user.get("identifier"), credit, body.notes.strip(), now)
         )
         c.execute(
-            "UPDATE issue_groups SET status='Resolved' WHERE id=?",
+            "UPDATE issue_groups SET status='Resolved' WHERE id=%s",
             (issue_id,)
         )
         c.execute(
-            "UPDATE complaints SET status='Resolved' WHERE id IN (SELECT complaint_id FROM complaint_group_links WHERE group_id=?)",
+            "UPDATE complaints SET status='Resolved' WHERE id IN (SELECT complaint_id FROM complaint_group_links WHERE group_id=%s)",
             (issue_id,)
         )
         reconcile_issue_risk(c, issue_id)
         c.commit()
-        updated = c.execute("SELECT risk_score, risk_level, status FROM issue_groups WHERE id=?", (issue_id,)).fetchone()
+        updated = c.execute("SELECT risk_score, risk_level, status FROM issue_groups WHERE id=%s", (issue_id,)).fetchone()
     return {
         "ok": True,
         "credit_applied": credit,
@@ -1002,7 +702,7 @@ def get_escalations(status: Optional[str] = None, user=Depends(require_roles("ma
         """
         params = []
         if status and status != "all":
-            query += " AND e.status=?"
+            query += " AND e.status=%s"
             params.append(status)
         query += " ORDER BY CASE e.status WHEN 'Active' THEN 0 ELSE 1 END, e.triggered_at DESC"
         rows = [dict(r) for r in c.execute(query, params).fetchall()]
@@ -1015,15 +715,15 @@ def close_escalation(escalation_id: int, body: EscalationCloseBody, user=Depends
         raise HTTPException(422, "Please provide comprehensive closure / inspection notes.")
     now = datetime.now(TZ).isoformat()
     with connect() as c:
-        esc = c.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone()
+        esc = c.execute("SELECT * FROM escalations WHERE id=%s", (escalation_id,)).fetchone()
         if not esc:
             raise HTTPException(404, "Escalation not found")
         if esc["status"] == "Closed":
             return {"ok": True, "message": "Escalation was already closed."}
         c.execute(
             """UPDATE escalations 
-               SET status='Closed', closed_at=?, closed_by=?, closure_notes=?
-               WHERE id=?""",
+               SET status='Closed', closed_at=%s, closed_by=%s, closure_notes=%s
+               WHERE id=%s""",
             (now, user.get("name") or user.get("identifier"), notes, escalation_id)
         )
         c.commit()
@@ -1032,16 +732,16 @@ def close_escalation(escalation_id: int, body: EscalationCloseBody, user=Depends
 @app.post("/api/manager/issues/{issue_id}/override-safety")
 def override_safety(issue_id: int, body: SafetyOverrideBody, user=Depends(require_roles("reviewer", "manager"))):
     with connect() as c:
-        row = c.execute("SELECT id FROM issue_groups WHERE id=?", (issue_id,)).fetchone()
+        row = c.execute("SELECT id FROM issue_groups WHERE id=%s", (issue_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Issue not found")
         c.execute(
-            "UPDATE issue_groups SET is_food_safety_hazard=? WHERE id=?",
+            "UPDATE issue_groups SET is_food_safety_hazard=%s WHERE id=%s",
             (1 if body.is_safety_hazard else 0, issue_id)
         )
         reconcile_issue_risk(c, issue_id)
         c.commit()
-        updated = c.execute("SELECT risk_score, risk_level, is_food_safety_hazard FROM issue_groups WHERE id=?", (issue_id,)).fetchone()
+        updated = c.execute("SELECT risk_score, risk_level, is_food_safety_hazard FROM issue_groups WHERE id=%s", (issue_id,)).fetchone()
     return {"ok": True, "issue": dict(updated)}
 
 @app.post("/api/manager/ai/trigger")
@@ -1056,12 +756,12 @@ def manager_meal_ai_summary(meal_id: str, user=Depends(require_roles("manager", 
     with connect() as c:
         complaints = [dict(row) for row in c.execute(
             """SELECT category,title,description,NULL AS rating FROM complaints
-               WHERE meal_id=? AND service_date=? ORDER BY id""",
+               WHERE meal_id=%s AND service_date=%s ORDER BY id""",
             (meal_id, today)
         ).fetchall()]
         ratings = [dict(row) for row in c.execute(
             """SELECT category, 'Meal rating' AS title, comment AS description, rating FROM feedback
-               WHERE meal_id=? AND service_date=? ORDER BY id""",
+               WHERE meal_id=%s AND service_date=%s ORDER BY id""",
             (meal_id, today)
         ).fetchall()]
     result = generate_meal_summary(meal["name"], complaints + ratings)
@@ -1083,15 +783,16 @@ def manager_feedback(user=Depends(require_roles("manager", "reviewer"))):
         items.append(d)
     for row in ratings:
         d = dict(row)
+        avg_val = round(float(d["average"]), 1) if d["average"] is not None else 0.0
         items.append({
             "id": f"rating-{d['meal_id']}-{d['service_date']}-{len(items)}",
             "type": "Rating",
             "meal_id": d["meal_id"],
             "service_date": d["service_date"],
             "category": d["category"] or "Meal rating",
-            "title": f"Average rating {round(d['average'],1)}/5",
+            "title": f"Average rating {avg_val}/5",
             "summary": "Aggregated meal-rating responses for this meal and category; individual comments are not shown.",
-            "rating": round(d["average"], 1),
+            "rating": avg_val,
             "count": d["count"],
             "status": "Recorded"
         })
@@ -1117,7 +818,7 @@ def manager_menu(menu_date: str, dietary: str = "non_veg", user=Depends(require_
         raise HTTPException(400, "Use YYYY-MM-DD for the menu date")
     with connect() as c:
         rows = c.execute(
-            "SELECT * FROM menu_items WHERE menu_date=? ORDER BY CASE meal_id WHEN 'breakfast' THEN 1 WHEN 'lunch' THEN 2 WHEN 'snacks' THEN 3 ELSE 4 END, id",
+            "SELECT * FROM menu_items WHERE menu_date=%s ORDER BY CASE meal_id WHEN 'breakfast' THEN 1 WHEN 'lunch' THEN 2 WHEN 'snacks' THEN 3 ELSE 4 END, id",
             (menu_date,)
         ).fetchall()
         if not rows:
@@ -1127,12 +828,12 @@ def manager_menu(menu_date: str, dietary: str = "non_veg", user=Depends(require_
                 for item_name in items:
                     dtype = "Non-Veg" if any(w in item_name.lower() for w in ["chicken", "fish", "egg", "mutton", "omelet"]) else "Veg"
                     c.execute(
-                        "INSERT INTO menu_items(menu_date,meal_id,name,description,dietary_type) VALUES(?,?,?,?,?)",
+                        "INSERT INTO menu_items(menu_date,meal_id,name,description,dietary_type) VALUES(%s,%s,%s,%s,%s)",
                         (menu_date, meal["id"], item_name, "Official CEG Hostel Menu", dtype)
                     )
             c.commit()
             rows = c.execute(
-                "SELECT * FROM menu_items WHERE menu_date=? ORDER BY CASE meal_id WHEN 'breakfast' THEN 1 WHEN 'lunch' THEN 2 WHEN 'snacks' THEN 3 ELSE 4 END, id",
+                "SELECT * FROM menu_items WHERE menu_date=%s ORDER BY CASE meal_id WHEN 'breakfast' THEN 1 WHEN 'lunch' THEN 2 WHEN 'snacks' THEN 3 ELSE 4 END, id",
                 (menu_date,)
             ).fetchall()
     return {"date": menu_date, "dietary": dietary, "items": [dict(r) for r in rows]}
@@ -1151,28 +852,28 @@ def save_manager_menu(body: MenuItemBody, user=Depends(require_roles("manager", 
         raise HTTPException(422, "Item name is required")
     with connect() as c:
         if body.id:
-            exists = c.execute("SELECT id FROM menu_items WHERE id=?", (body.id,)).fetchone()
+            exists = c.execute("SELECT id FROM menu_items WHERE id=%s", (body.id,)).fetchone()
             if not exists:
                 raise HTTPException(404, "Menu item not found")
             c.execute(
-                "UPDATE menu_items SET menu_date=?,meal_id=?,name=?,description=?,dietary_type=? WHERE id=?",
+                "UPDATE menu_items SET menu_date=%s,meal_id=%s,name=%s,description=%s,dietary_type=%s WHERE id=%s",
                 (body.menu_date, body.meal_id, name, body.description[:250], body.dietary_type, body.id)
             )
             item_id = body.id
         else:
             cur = c.execute(
-                "INSERT INTO menu_items(menu_date,meal_id,name,description,dietary_type) VALUES(?,?,?,?,?)",
+                "INSERT INTO menu_items(menu_date,meal_id,name,description,dietary_type) VALUES(%s,%s,%s,%s,%s) RETURNING id",
                 (body.menu_date, body.meal_id, name, body.description[:250], body.dietary_type)
             )
-            item_id = cur.lastrowid
+            item_id = cur.fetchone()["id"]
         c.commit()
-        row = c.execute("SELECT * FROM menu_items WHERE id=?", (item_id,)).fetchone()
+        row = c.execute("SELECT * FROM menu_items WHERE id=%s", (item_id,)).fetchone()
     return dict(row)
 
 @app.delete("/api/manager/menu/{item_id}")
 def delete_manager_menu(item_id: int, user=Depends(require_roles("manager", "reviewer"))):
     with connect() as c:
-        cur = c.execute("DELETE FROM menu_items WHERE id=?", (item_id,))
+        cur = c.execute("DELETE FROM menu_items WHERE id=%s", (item_id,))
         c.commit()
     if cur.rowcount == 0:
         raise HTTPException(404, "Menu item not found")

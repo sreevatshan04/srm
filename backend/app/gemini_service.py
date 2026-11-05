@@ -4,6 +4,7 @@ Uses Google's `google-genai` SDK with fast Gemini Flash models.
 Ensures zero latency impact on student actions by running strictly in background tasks.
 Provides robust fallback to deterministic rule-based analysis if API is absent or unavailable.
 Integrates directly with the MessMate Risk-Score Engine.
+Fully migrated to PostgreSQL / Neon.
 """
 
 import os
@@ -242,7 +243,7 @@ def process_pending_complaints_job(connect_fn, meal_info_dict, tz):
                             continue
                         
                         existing = c.execute(
-                            "SELECT id, count, status FROM issue_groups WHERE meal_id=? AND issue_key=?",
+                            "SELECT id, count, status FROM issue_groups WHERE meal_id=%s AND issue_key=%s",
                             (meal_id, key)
                         ).fetchone()
                         
@@ -260,45 +261,54 @@ def process_pending_complaints_job(connect_fn, meal_info_dict, tz):
                             gid = existing["id"]
                             c.execute(
                                 """UPDATE issue_groups 
-                                   SET count=count+?, title=?, summary=?, category=?, confidence=?, 
-                                       is_food_safety_hazard=MAX(is_food_safety_hazard, ?),
-                                       last_reported_at=?
-                                   WHERE id=?""",
+                                   SET count=count+%s, title=%s, summary=%s, category=%s, confidence=%s, 
+                                       is_food_safety_hazard=GREATEST(is_food_safety_hazard, %s),
+                                       last_reported_at=%s
+                                   WHERE id=%s""",
                                 (len(c_ids), title, summary, cat, conf, is_hazard, now_iso, gid)
                             )
                             # If previously resolved/responded, open a new response cycle
                             if existing["status"] in ("Responded", "Resolved"):
-                                max_cycle = c.execute("SELECT COALESCE(MAX(cycle_number), 1) as m FROM response_cycles WHERE group_id=?", (gid,)).fetchone()["m"]
+                                max_cycle = c.execute("SELECT COALESCE(MAX(cycle_number), 1) as m FROM response_cycles WHERE group_id=%s", (gid,)).fetchone()["m"]
                                 c.execute(
-                                    """INSERT OR IGNORE INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
-                                       VALUES(?,?,?,?, 'Open')""",
+                                    """INSERT INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
+                                       VALUES(%s,%s,%s,%s, 'Open')
+                                       ON CONFLICT (group_id, cycle_number) DO NOTHING""",
                                     (gid, max_cycle + 1, now_iso, deadline_iso)
                                 )
-                                c.execute("UPDATE issue_groups SET status='Reopened', deadline=? WHERE id=?", (deadline_iso, gid))
+                                c.execute("UPDATE issue_groups SET status='Reopened', deadline=%s WHERE id=%s", (deadline_iso, gid))
                         else:
                             cur = c.execute(
                                 """INSERT INTO issue_groups(
                                        meal_id, service_date, issue_key, category, title, summary, count, 
                                        confidence, is_food_safety_hazard, first_reported_at, last_reported_at, deadline, status
-                                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'Open')""",
+                                   ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 'Open') RETURNING id""",
                                 (meal_id, service_date, key, cat, title, summary, len(c_ids), conf, is_hazard, now_iso, now_iso, deadline_iso)
                             )
-                            gid = cur.lastrowid
+                            gid = cur.fetchone()["id"]
                             c.execute(
-                                """INSERT OR IGNORE INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
-                                   VALUES(?, 1, ?, ?, 'Open')""",
+                                """INSERT INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
+                                   VALUES(%s, 1, %s, %s, 'Open')
+                                   ON CONFLICT (group_id, cycle_number) DO NOTHING""",
                                 (gid, now_iso, deadline_iso)
                             )
                         
                         # Record week recurrence record (deduplicated!)
                         c.execute(
-                            "INSERT OR IGNORE INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?,?,?)",
+                            """INSERT INTO issue_week_records(group_id, week_key, first_seen_at)
+                               VALUES(%s,%s,%s)
+                               ON CONFLICT (group_id, week_key) DO NOTHING""",
                             (gid, w_key, now_iso)
                         )
 
                         for cid in c_ids:
-                            c.execute("INSERT OR REPLACE INTO complaint_group_links(complaint_id,group_id) VALUES(?,?)", (cid, gid))
-                            c.execute("UPDATE complaints SET processed_for_ai=1 WHERE id=?", (cid,))
+                            c.execute(
+                                """INSERT INTO complaint_group_links(complaint_id, group_id)
+                                   VALUES(%s,%s)
+                                   ON CONFLICT (complaint_id) DO UPDATE SET group_id = EXCLUDED.group_id""",
+                                (cid, gid)
+                            )
+                            c.execute("UPDATE complaints SET processed_for_ai=1 WHERE id=%s", (cid,))
                         
                         # Reconcile risk score for this issue group immediately
                         reconcile_issue_risk(c, gid)
@@ -307,7 +317,7 @@ def process_pending_complaints_job(connect_fn, meal_info_dict, tz):
                     for comp in comp_batch:
                         key, cat, title, summary, conf, is_hazard = normalise_rule_based(comp["category"] + " " + comp["title"] + " " + comp["description"])
                         existing = c.execute(
-                            "SELECT id, status FROM issue_groups WHERE meal_id=? AND issue_key=?",
+                            "SELECT id, status FROM issue_groups WHERE meal_id=%s AND issue_key=%s",
                             (meal_id, key)
                         ).fetchone()
                         m_end = meal_info_dict.get(meal_id, {}).get("end", "22:00")
@@ -326,47 +336,56 @@ def process_pending_complaints_job(connect_fn, meal_info_dict, tz):
                             gid = existing["id"]
                             c.execute(
                                 """UPDATE issue_groups 
-                                   SET count=count+1, category=?, confidence=?, 
-                                       is_food_safety_hazard=MAX(is_food_safety_hazard, ?),
-                                       last_reported_at=?
-                                   WHERE id=?""",
+                                   SET count=count+1, category=%s, confidence=%s, 
+                                       is_food_safety_hazard=GREATEST(is_food_safety_hazard, %s),
+                                       last_reported_at=%s
+                                   WHERE id=%s""",
                                 (cat, conf, is_hazard_int, now_iso, gid)
                             )
                             if existing["status"] in ("Responded", "Resolved"):
-                                max_cycle = c.execute("SELECT COALESCE(MAX(cycle_number), 1) as m FROM response_cycles WHERE group_id=?", (gid,)).fetchone()["m"]
+                                max_cycle = c.execute("SELECT COALESCE(MAX(cycle_number), 1) as m FROM response_cycles WHERE group_id=%s", (gid,)).fetchone()["m"]
                                 c.execute(
-                                    """INSERT OR IGNORE INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
-                                       VALUES(?,?,?,?, 'Open')""",
+                                    """INSERT INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
+                                       VALUES(%s,%s,%s,%s, 'Open')
+                                       ON CONFLICT (group_id, cycle_number) DO NOTHING""",
                                     (gid, max_cycle + 1, now_iso, deadline_iso)
                                 )
-                                c.execute("UPDATE issue_groups SET status='Reopened', deadline=? WHERE id=?", (deadline_iso, gid))
+                                c.execute("UPDATE issue_groups SET status='Reopened', deadline=%s WHERE id=%s", (deadline_iso, gid))
                         else:
                             cur = c.execute(
                                 """INSERT INTO issue_groups(
                                        meal_id, service_date, issue_key, category, title, summary, count, 
                                        confidence, is_food_safety_hazard, first_reported_at, last_reported_at, deadline, status
-                                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'Open')""",
+                                   ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 'Open') RETURNING id""",
                                 (meal_id, service_date, key, cat, title, summary, 1, conf, is_hazard_int, now_iso, now_iso, deadline_iso)
                             )
-                            gid = cur.lastrowid
+                            gid = cur.fetchone()["id"]
                             c.execute(
-                                """INSERT OR IGNORE INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
-                                   VALUES(?, 1, ?, ?, 'Open')""",
+                                """INSERT INTO response_cycles(group_id, cycle_number, started_at, deadline, status)
+                                   VALUES(%s, 1, %s, %s, 'Open')
+                                   ON CONFLICT (group_id, cycle_number) DO NOTHING""",
                                 (gid, now_iso, deadline_iso)
                             )
 
                         c.execute(
-                            "INSERT OR IGNORE INTO issue_week_records(group_id, week_key, first_seen_at) VALUES(?,?,?)",
+                            """INSERT INTO issue_week_records(group_id, week_key, first_seen_at)
+                               VALUES(%s,%s,%s)
+                               ON CONFLICT (group_id, week_key) DO NOTHING""",
                             (gid, w_key, now_iso)
                         )
-                        c.execute("INSERT OR REPLACE INTO complaint_group_links(complaint_id,group_id) VALUES(?,?)", (comp["id"], gid))
-                        c.execute("UPDATE complaints SET processed_for_ai=1 WHERE id=?", (comp["id"],))
+                        c.execute(
+                            """INSERT INTO complaint_group_links(complaint_id, group_id)
+                               VALUES(%s,%s)
+                               ON CONFLICT (complaint_id) DO UPDATE SET group_id = EXCLUDED.group_id""",
+                            (comp["id"], gid)
+                        )
+                        c.execute("UPDATE complaints SET processed_for_ai=1 WHERE id=%s", (comp["id"],))
                         reconcile_issue_risk(c, gid)
 
             # Record AI processing job
             c.execute(
                 """INSERT INTO ai_processing_jobs(batch_size, status, model, provider, created_at)
-                   VALUES(?,?,?,?,?)""",
+                   VALUES(%s,%s,%s,%s,%s)""",
                 (len(complaints_list), "completed", get_gemini_config()[1], "google-genai" if is_ai_enabled() else "rule-based", now_iso)
             )
             c.commit()
